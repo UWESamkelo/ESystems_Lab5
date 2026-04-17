@@ -1,0 +1,210 @@
+/* Title: Getting Ready to Program the Serial Communication of the Smart Home System
+Author: Samkelo Mareka
+Date: 16/03/2026
+Student ID: 24004894
+*/
+
+#include "mbed.h"
+#include <string>
+#include <ctime>
+
+// --- Pins ---
+BusIn cols(PB_12, PB_13, PB_15, PC_6); 
+AnalogIn mq2(A0);         
+AnalogIn lm35(A1);        
+AnalogIn pot(A2);         
+DigitalIn alarmBtn(D2, PullDown); 
+DigitalOut alarmLed(LED1); 
+PwmOut buzzer(PE_10);     
+
+// Set up serial at 115200 baud
+static UnbufferedSerial pc(USBTX, USBRX, 115200);
+
+// --- Global Variables ---
+const char keyMap[4][4] = {
+    {'1','2','3','A'},
+    {'4','5','6','B'},
+    {'7','8','9','C'},
+    {'*','0','#','D'}
+};
+
+// Event Log Arrays 
+float log_temp[5];
+float log_gas[5];
+time_t log_time[5];
+int num_events = 0;
+
+bool alarm_on = false;
+bool dis_alarm = false; 
+string entered_code = "";
+
+// FSM Variables
+int keypad_state = 0; // 0 = scan, 1 = debounce, 2 = wait for release
+int current_r = 0;
+int current_c = 0;
+int debounce_timer = 0;
+
+// --- Functions ---
+
+// Array shift to save the last 5 events
+void save_event(float temp_val, float gas_val) {
+    // Shift old events down
+    for(int i = 4; i > 0; i--) {
+        log_temp[i] = log_temp[i-1];
+        log_gas[i] = log_gas[i-1];
+        log_time[i] = log_time[i-1];
+    }
+    
+    // Save new event at the top 
+    log_temp[0] = temp_val;
+    log_gas[0] = gas_val;
+    log_time[0] = time(NULL);    // Get timestamp from RTC
+    
+    if(num_events < 5) {
+        num_events++;
+    }
+}
+
+// if/else FSM for the keypad
+char check_keypad() {
+    if (keypad_state == 0) {      // Scan the rows
+        for (int r = 0; r < 4; r++) {
+            rows = ~(1 << r);     // Drive the row low
+            for (int c = 0; c < 4; c++) {
+                if ((cols.read() & (1 << c)) == 0) { // Key is pressed
+                    current_r = r;
+                    current_c = c;
+                    keypad_state = 1;
+                    debounce_timer = 0;
+                    return '\0';
+                }
+            }
+        }
+    } 
+    else if (keypad_state == 1) { // DEBOUNCING
+        debounce_timer++;
+        if (debounce_timer >= 5) { // wait about 50ms
+            rows = ~(1 << current_r);
+            if ((cols.read() & (1 << current_c)) == 0) {
+                keypad_state = 2; // confirmed press
+            } else {
+                keypad_state = 0; // glitch, go back to scan
+            }
+        }
+    } 
+    else if (keypad_state == 2) { // Wait for release
+        rows = ~(1 << current_r);
+        if ((cols.read() & (1 << current_c)) != 0) { // Key is released
+            keypad_state = 0;
+            return keyMap[current_r][current_c];
+        }
+    }
+    return '\0';
+}
+
+// --- Main ---
+int main() {
+    cols.mode(PullUp);
+    set_time(1773590400); 
+    
+    printf("\n--- Home System Initialized ---\n");
+
+    int print_delay = 0;
+
+    while (true) {
+        // Read sensors
+        float temp_limit = 25.0f + (pot.read() * 12.0f);
+        float gas_limit = pot.read() * 800.0f;          
+        float temp_reading = lm35.read() * 330.0f;           
+        float gas_reading = mq2.read() * 1000.0f;            
+
+        // Trigger Alarm
+        if (alarm_on == false && dis_alarm == false) {
+            if (alarmBtn == 1 || temp_reading > temp_limit || gas_reading > gas_limit) {
+                alarm_on = true;
+                save_event(temp_reading, gas_reading);
+                
+                printf("\nALARM ACTIVE!\n");
+                printf("Enter 4-Digit Code to Deactivate:\n");
+            }
+        }
+
+        // Reset system when sensors are safe again
+        if (dis_alarm == true) {
+            if (temp_reading < temp_limit && gas_reading < gas_limit && alarmBtn == 0) {
+                dis_alarm = false;
+                printf("\nSensors normal. System ready.\n");
+            }
+        }
+
+        // Buzzer and LED output
+        if (alarm_on == true) {
+            alarmLed = !alarmLed; 
+            buzzer.period_ms(2);   
+            buzzer.write(0.5f);    
+        } else {
+            alarmLed = 0; 
+            buzzer.write(0.0f);    
+        }
+
+        // Read Keypad
+        char key = check_keypad();
+        
+        if (key != '\0') {
+            if (alarm_on == true && key != '#') {
+                entered_code += key;
+                printf("*"); fflush(stdout);
+                
+                if (entered_code.length() == 4) {
+                    if (entered_code == "1805") {
+                        alarm_on = false;
+                        dis_alarm = true; // Lock it until safe
+                        entered_code = "";
+                        printf("\nCode correct. Alarm off.\n");
+                    } else {
+                        printf("\nWrong Code. Try again:\n");
+                        entered_code = "";
+                    }
+                }
+            } 
+            else if (key == '#' && alarm_on == false) {
+                printf("\n--- Recent Alarm Events ---\n");
+                if (num_events == 0) {
+                    printf("No events recorded yet.\n");
+                }
+                for (int i = 0; i < num_events; i++) {
+                    char timeStr[32];
+                    strftime(timeStr, 32, "%H:%M:%S", localtime(&log_time[i]));
+                    
+                    // Manual decimal printing for log
+                    int t_whole = (int)log_temp[i];
+                    int t_dec = abs((int)((log_temp[i] - t_whole) * 100));
+                    int g_whole = (int)log_gas[i];
+                    int g_dec = abs((int)((log_gas[i] - g_whole) * 100));
+                    
+                    printf("[%s] Temp: %d.%02d C, Gas: %d.%02d ppm\n", timeStr, t_whole, t_dec, g_whole, g_dec);
+                }
+            }
+        }
+
+        // Print status every 1 second
+        print_delay++;
+        if (print_delay >= 100) {
+            if (alarm_on == false) {
+                // Manual decimal printing for status monitor
+                int ct_w = (int)temp_reading, ct_d = abs((int)((temp_reading - ct_w) * 100));
+                int tt_w = (int)temp_limit, tt_d = abs((int)((temp_limit - tt_w) * 100));
+                
+                printf("Status -> Temp: %d.%02d C (Thresh: %d.%02d) | ", ct_w, ct_d, tt_w, tt_d);
+                
+                int cg_w = (int)gas_reading, cg_d = abs((int)((gas_reading - cg_w) * 100));
+                int tg_w = (int)gas_limit, tg_d = abs((int)((gas_limit - tg_w) * 100));
+                
+                printf("Gas: %d.%02d ppm (Thresh: %d.%02d)\n", cg_w, cg_d, tg_w, tg_d);
+            }
+            print_delay = 0;
+        }
+
+        ThisThread::sleep_for(10ms);
+    }
+}
